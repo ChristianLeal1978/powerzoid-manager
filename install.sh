@@ -8,8 +8,10 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+APP_ID="cl.cleal.PowerzoidManager"
 LAUNCHER="$BIN_DIR/powerzoid-manager"
-DESKTOP_FILE="$APPS_DIR/cl.cleal.PowerzoidManager.desktop"
+DESKTOP_FILE="$APPS_DIR/$APP_ID.desktop"
 
 G='\033[0;32m'; R='\033[0;31m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
@@ -19,7 +21,7 @@ command -v python3 &>/dev/null || { echo -e "${R}Error:${NC} instala python3 pri
 python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1')" 2>/dev/null \
     || { echo -e "${R}Error:${NC} faltan los bindings de GTK4/Libadwaita para Python (paquete python3-gobject)"; exit 1; }
 
-mkdir -p "$BIN_DIR" "$APPS_DIR"
+mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
 
 cp "$DIR/powerzoid_manager.py" "$BIN_DIR/powerzoid_manager.py"
 chmod +x "$BIN_DIR/powerzoid_manager.py"
@@ -31,18 +33,26 @@ EOF
 chmod +x "$LAUNCHER"
 echo -e "  ${G}✓${NC}  Instalado en $LAUNCHER"
 
+cp "$DIR/data/icons/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg"
+echo -e "  ${G}✓${NC}  Ícono instalado en $ICON_DIR/$APP_ID.svg"
+
 cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=PowerZoid Manager
 Comment=Instala, actualiza y desinstala las extensiones PowerZoid
 Exec=$LAUNCHER
-Icon=application-x-addon
+Icon=$APP_ID
 Terminal=false
-Categories=System;Settings;
+Categories=System;GTK;
+StartupWMClass=$APP_ID
 StartupNotify=true
 EOF
 echo -e "  ${G}✓${NC}  Lanzador de aplicaciones creado en $DESKTOP_FILE"
+
+update-desktop-database "$APPS_DIR" &>/dev/null || true
+gtk-update-icon-cache -qtf "$HOME/.local/share/icons/hicolor" &>/dev/null || true
+echo -e "  ${G}✓${NC}  Ya debería verse en el resumen de actividades → cuadrícula de apps"
 
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""

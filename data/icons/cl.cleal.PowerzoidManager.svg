@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">PowerZoid Manager icon</title>
+  <desc id="desc">A single white jigsaw piece on a blue-to-purple rounded square, with a small green plus badge to represent installing/managing extensions.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="80" y1="80" x2="432" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3D5CFF"/>
+      <stop offset="1" stop-color="#7B3DFF"/>
+    </linearGradient>
+    <linearGradient id="piece" x1="150" y1="116" x2="362" y2="396" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E7E9FF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="url(#bg)"/>
+
+  <!-- Jigsaw piece: tab on top, notch on bottom -->
+  <path d="M166,150 L222,150 A34,34 0 1 1 290,150 L346,150 A16,16 0 0 1 362,166
+           L362,346 A16,16 0 0 1 346,362 L290,362 A34,34 0 1 0 222,362
+           L166,362 A16,16 0 0 1 150,346 L150,166 A16,16 0 0 1 166,150 Z"
+        fill="url(#piece)"/>
+
+  <!-- Install/manage badge -->
+  <circle cx="358" cy="358" r="52" fill="#22C55E"/>
+  <path d="M358,336 v44 M336,358 h44" stroke="#FFFFFF" stroke-width="12" stroke-linecap="round"/>
+</svg>
