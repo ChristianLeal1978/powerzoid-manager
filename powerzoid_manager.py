@@ -22,6 +22,20 @@ SELF_DIR_NAME = "powerzoid-manager"
 GIT_PULL_TIMEOUT = 15
 SCRIPT_TIMEOUT = 300
 
+DEFAULT_ICON = "application-x-addon-symbolic"
+ICON_BY_UUID = {
+    "powerzoid-calendar@cleal.cl": "x-office-calendar-symbolic",
+    "powerzoid-claude@cleal.cl": "battery-level-50-symbolic",
+    "powerzoid-color-picker@cleal.cl": "color-select-symbolic",
+    "powerzoid-deploy@cleal.cl": "network-transmit-receive-symbolic",
+    "powerzoid-memory@cleal.cl": "org.gnome.SystemMonitor-symbolic",
+    "powerzoid-music@cleal.cl": "audio-headphones-symbolic",
+    "powerzoid-screenshot@cleal.cl": "camera-photo-symbolic",
+    "powerzoid-sync@cleal.cl": "folder-remote-symbolic",
+    "powerzoid-todo@cleal.cl": "task-due-symbolic",
+    "powerzoid-workspaces@cleal.cl": "view-grid-symbolic",
+}
+
 
 @dataclass
 class Extension:
@@ -268,6 +282,8 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         self.extensions: list[Extension] = []
         self.install_all_check: Gtk.CheckButton | None = None
         self.remove_all_check: Gtk.CheckButton | None = None
+        self._rows: dict[str, Adw.ActionRow] = {}
+        self._suffixes: dict[str, Gtk.Box] = {}
 
         toolbar_view = Adw.ToolbarView()
 
@@ -279,8 +295,20 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         header.pack_end(refresh_btn)
         toolbar_view.add_top_bar(header)
 
-        self.banner = Adw.Banner(title="Buscando actualizaciones desde GitHub…")
-        toolbar_view.add_top_bar(self.banner)
+        self.status_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10,
+            margin_top=8,
+            margin_bottom=8,
+            margin_start=14,
+            margin_end=14,
+        )
+        self.status_label = Gtk.Label(label="Buscando actualizaciones…", xalign=0)
+        self.status_progress = Gtk.ProgressBar(hexpand=True, valign=Gtk.Align.CENTER)
+        self.status_box.append(self.status_label)
+        self.status_box.append(self.status_progress)
+        self.status_box.set_visible(False)
+        toolbar_view.add_top_bar(self.status_box)
 
         scroller = Gtk.ScrolledWindow(vexpand=True)
         clamp = Adw.Clamp(maximum_size=640, margin_top=16, margin_bottom=16, margin_start=12, margin_end=12)
@@ -296,27 +324,62 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
     # ---------------------------------------------------------------- scan
 
     def refresh(self, pull: bool = False) -> None:
+        self._rebuild()
         if not pull:
-            self._rebuild()
             return
 
-        self.banner.set_revealed(True)
+        repos = sorted({e.repo_path for e in self.extensions if (e.repo_path / ".git").is_dir()})
+        total = len(repos)
+        if total == 0:
+            return
+
+        self.status_label.set_label("Buscando actualizaciones…")
+        self.status_progress.set_fraction(0.0)
+        self.status_box.set_visible(True)
 
         def worker():
-            for repo in sorted(REPOS_DIR.glob("powerzoid-*")):
-                if repo.is_dir():
-                    git_pull(repo)
-            GLib.idle_add(self._after_pull)
+            for i, repo in enumerate(repos, start=1):
+                git_pull(repo)
+                GLib.idle_add(self._on_repo_pulled, repo, i, total)
+            GLib.idle_add(self._on_pull_done)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _after_pull(self) -> bool:
-        self.banner.set_revealed(False)
-        self._rebuild()
+    def _on_repo_pulled(self, repo: Path, done: int, total: int) -> bool:
+        self.status_progress.set_fraction(done / total)
+
+        meta_path = find_metadata(repo)
+        if meta_path is not None:
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                meta = None
+            if meta:
+                for ext in self.extensions:
+                    if ext.repo_path == repo:
+                        ext.source_version = meta.get("version", ext.source_version)
+                        self._refresh_row_suffix(ext)
         return False
+
+    def _on_pull_done(self) -> bool:
+        self.status_box.set_visible(False)
+        return False
+
+    def _refresh_row_suffix(self, ext: Extension) -> None:
+        row = self._rows.get(ext.uuid)
+        if row is None:
+            return
+        old_suffix = self._suffixes.get(ext.uuid)
+        if old_suffix is not None:
+            old_suffix.unparent()
+        new_suffix = self._build_suffix(ext)
+        row.add_suffix(new_suffix)
+        self._suffixes[ext.uuid] = new_suffix
 
     def _rebuild(self) -> None:
         self.extensions = discover_extensions()
+        self._rows = {}
+        self._suffixes = {}
 
         child = self.content_box.get_first_child()
         while child is not None:
@@ -343,7 +406,12 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             else "Ninguna instalada — elige cuáles instalar"
         )
 
-        bulk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        group = Adw.PreferencesGroup(title="Extensiones PowerZoid")
+        for ext in self.extensions:
+            group.add(self._build_row(ext))
+        self.content_box.append(group)
+
+        bulk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=4)
 
         self.install_all_check = Gtk.CheckButton(
             label=f"Instalar todas las no instaladas ({len(not_installed)})"
@@ -362,28 +430,33 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         if not_installed or installed:
             self.content_box.append(bulk_box)
 
-        group = Adw.PreferencesGroup(title="Extensiones PowerZoid")
-        for ext in self.extensions:
-            group.add(self._build_row(ext))
-        self.content_box.append(group)
-
     def _build_row(self, ext: Extension) -> Adw.ActionRow:
         row = Adw.ActionRow(title=ext.name, subtitle=ext.description)
         row.set_title_lines(1)
         row.set_subtitle_lines(2)
 
+        icon = Gtk.Image.new_from_icon_name(ICON_BY_UUID.get(ext.uuid, DEFAULT_ICON))
+        icon.set_pixel_size(24)
+        row.add_prefix(icon)
+
+        suffix = self._build_suffix(ext)
+        row.add_suffix(suffix)
+
+        self._rows[ext.uuid] = row
+        self._suffixes[ext.uuid] = suffix
+        return row
+
+    def _build_suffix(self, ext: Extension) -> Gtk.Box:
         suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, valign=Gtk.Align.CENTER)
 
-        if not ext.is_installed:
-            status = Gtk.Label(label="No instalada")
-            status.add_css_class("dim-label")
-        elif ext.has_update:
-            status = Gtk.Label(label=f"v{ext.installed_version} → v{ext.source_version}")
-            status.add_css_class("warning")
-        else:
-            status = Gtk.Label(label=f"v{ext.installed_version}")
-            status.add_css_class("dim-label")
-        suffix.append(status)
+        if ext.is_installed:
+            if ext.has_update:
+                status = Gtk.Label(label=f"v{ext.installed_version} → v{ext.source_version}")
+                status.add_css_class("warning")
+            else:
+                status = Gtk.Label(label=f"v{ext.installed_version}")
+                status.add_css_class("dim-label")
+            suffix.append(status)
 
         if not ext.is_installed:
             install_btn = Gtk.Button(label="Instalar")
@@ -402,8 +475,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             del_btn.connect("clicked", lambda *_, e=ext: self._confirm_remove_one(e))
             suffix.append(del_btn)
 
-        row.add_suffix(suffix)
-        return row
+        return suffix
 
     # ------------------------------------------------------------ confirm
 
