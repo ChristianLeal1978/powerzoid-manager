@@ -198,9 +198,13 @@ def git_pull(repo: Path) -> None:
 
 def generic_install(ext: Extension) -> None:
     """Instala copiando los archivos de la extensión, para repos sin install.sh."""
+    source = ext.meta_path.parent
     target = EXT_INSTALL_DIR / ext.uuid
-    target.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(ext.meta_path.parent, target, dirs_exist_ok=True)
+    # Algunos repos symlinkean su carpeta de extensión directamente dentro de
+    # EXT_INSTALL_DIR para desarrollo; en ese caso copiar sería copiarla sobre sí misma.
+    if not (target.exists() and target.resolve() == source.resolve()):
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target, dirs_exist_ok=True)
     subprocess.run(["gnome-extensions", "enable", ext.uuid], capture_output=True, check=False)
 
 
@@ -584,11 +588,21 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             dlg.present(self)
         else:
             def worker():
-                generic_install(ext)
-                write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
-                GLib.idle_add(self._rebuild)
+                error = None
+                try:
+                    generic_install(ext)
+                    write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                except OSError as exc:
+                    error = str(exc)
+                GLib.idle_add(self._on_generic_done, error)
 
             threading.Thread(target=worker, daemon=True).start()
+
+    def _on_generic_done(self, error: str | None) -> bool:
+        self._rebuild()
+        if error:
+            self._show_info("No se pudo completar la acción", error)
+        return False
 
     def _confirm_remove_one(self, ext: Extension) -> None:
         self._confirm(
@@ -609,8 +623,12 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             dlg.present(self)
         else:
             def worker():
-                generic_uninstall(ext)
-                GLib.idle_add(self._rebuild)
+                error = None
+                try:
+                    generic_uninstall(ext)
+                except OSError as exc:
+                    error = str(exc)
+                GLib.idle_add(self._on_generic_done, error)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -630,7 +648,11 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             ok_label="Instalar todas",
             destructive=False,
             on_ok=lambda: self._run_bulk(
-                pending, install=True, on_finish=lambda: self._reset_bulk_check(check), check=check
+                pending,
+                install=True,
+                on_finish=lambda: self._reset_bulk_check(check),
+                check=check,
+                verb="Instalando",
             ),
             on_cancel=lambda: check.set_active(False),
         )
@@ -649,7 +671,11 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             ok_label="Eliminar todas",
             destructive=True,
             on_ok=lambda: self._run_bulk(
-                installed, install=False, on_finish=lambda: self._reset_bulk_check(check), check=check
+                installed,
+                install=False,
+                on_finish=lambda: self._reset_bulk_check(check),
+                check=check,
+                verb="Eliminando",
             ),
             on_cancel=lambda: check.set_active(False),
         )
@@ -668,43 +694,89 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             body=f"Se actualizarán {len(outdated)} extensiones: {names}.",
             ok_label="Actualizar todas",
             destructive=False,
-            on_ok=lambda: self._run_bulk(outdated, install=True, on_finish=None, check=self.update_all_btn),
+            on_ok=lambda: self._run_bulk(
+                outdated, install=True, on_finish=None, check=self.update_all_btn, verb="Actualizando"
+            ),
         )
 
-    def _run_bulk(self, items: list[Extension], install: bool, on_finish, check: Gtk.Widget | None = None) -> None:
+    def _run_bulk(
+        self,
+        items: list[Extension],
+        install: bool,
+        on_finish,
+        check: Gtk.Widget | None = None,
+        verb: str = "Procesando",
+    ) -> None:
         if check is not None:
             check.set_sensitive(False)
 
+        total = len(items)
+        self.status_label.set_label(f"{verb} 0/{total}…")
+        self.status_progress.set_fraction(0.0)
+        self.status_box.set_visible(True)
+
         def worker():
-            for ext in items:
-                script = ext.install_script if install else ext.uninstall_script
-                if script is not None:
-                    try:
-                        result = subprocess.run(
-                            ["bash", str(script)],
-                            cwd=str(script.parent),
-                            stdin=subprocess.DEVNULL,
-                            capture_output=True,
-                            timeout=SCRIPT_TIMEOUT,
-                            check=False,
-                        )
-                        if install and result.returncode == 0:
+            failures: list[str] = []
+            for i, ext in enumerate(items, start=1):
+                ok = True
+                try:
+                    script = ext.install_script if install else ext.uninstall_script
+                    if script is not None:
+                        try:
+                            result = subprocess.run(
+                                ["bash", str(script)],
+                                cwd=str(script.parent),
+                                stdin=subprocess.DEVNULL,
+                                capture_output=True,
+                                timeout=SCRIPT_TIMEOUT,
+                                check=False,
+                            )
+                            ok = result.returncode == 0
+                        except (subprocess.TimeoutExpired, OSError):
+                            ok = False
+                        if install and ok:
                             write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
-                    except (subprocess.TimeoutExpired, OSError):
-                        pass
-                else:
-                    (generic_install if install else generic_uninstall)(ext)
-                    if install:
-                        write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
-            GLib.idle_add(self._finish_bulk, on_finish)
+                    else:
+                        (generic_install if install else generic_uninstall)(ext)
+                        if install:
+                            write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                except OSError:
+                    # No dejamos que una extensión rota (p. ej. un symlink de desarrollo
+                    # que rompe la copia) tumbe el hilo y deje sin procesar al resto.
+                    ok = False
+                if not ok:
+                    failures.append(ext.name)
+                GLib.idle_add(self._on_bulk_item_done, ext, i, total, verb)
+            GLib.idle_add(self._finish_bulk, on_finish, failures)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_bulk(self, on_finish) -> bool:
+    def _on_bulk_item_done(self, ext: Extension, done: int, total: int, verb: str) -> bool:
+        self.status_progress.set_fraction(done / total)
+        self.status_label.set_label(f"{verb} {done}/{total}: {ext.name}")
+        ext.installed_version = read_installed_version(ext.uuid)
+        ext.installed_commit = read_installed_commit(ext.uuid)
+        self._refresh_row_suffix(ext)
+        return False
+
+    def _finish_bulk(self, on_finish, failures: list[str]) -> bool:
+        self.status_box.set_visible(False)
         if on_finish:
             on_finish()
         self._rebuild()
+        if failures:
+            self._show_info(
+                heading="Algunas extensiones no se pudieron procesar",
+                body="Fallaron: " + ", ".join(failures) + ". Prueba con esa extensión individualmente para ver el error.",
+            )
         return False
+
+    def _show_info(self, heading: str, body: str) -> None:
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("ok", "Entendido")
+        dialog.set_default_response("ok")
+        dialog.set_close_response("ok")
+        dialog.present(self)
 
 
 class PowerzoidManagerApp(Adw.Application):
