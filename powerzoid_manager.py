@@ -21,6 +21,7 @@ EXT_INSTALL_DIR = Path.home() / ".local/share/gnome-shell/extensions"
 SELF_DIR_NAME = "powerzoid-manager"
 GIT_PULL_TIMEOUT = 15
 SCRIPT_TIMEOUT = 300
+INSTALLED_COMMIT_FILENAME = ".powerzoid-installed-commit"
 
 DEFAULT_ICON = "application-x-addon-symbolic"
 ICON_BY_UUID = {
@@ -47,7 +48,9 @@ class Extension:
     source_version: int | None
     install_script: Path | None
     uninstall_script: Path | None
+    source_commit: str | None = None
     installed_version: int | None = None
+    installed_commit: str | None = None
 
     @property
     def is_installed(self) -> bool:
@@ -55,12 +58,17 @@ class Extension:
 
     @property
     def has_update(self) -> bool:
-        return (
-            self.is_installed
-            and isinstance(self.source_version, int)
+        if not self.is_installed:
+            return False
+        if (
+            isinstance(self.source_version, int)
             and isinstance(self.installed_version, int)
             and self.source_version > self.installed_version
-        )
+        ):
+            return True
+        # Sin bump de versión, pero el commit instalado no coincide con el del repo
+        # (o nunca se registró un commit instalado): puede haber cambios sin liberar.
+        return bool(self.source_commit) and self.source_commit != self.installed_commit
 
 
 def find_metadata(repo: Path) -> Path | None:
@@ -85,6 +93,44 @@ def read_installed_version(uuid: str) -> int | None:
         return json.loads(meta_path.read_text()).get("version")
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def read_repo_commit(repo: Path) -> str | None:
+    """Devuelve el hash del commit HEAD del repo, o None si no es un repo git."""
+    if not (repo / ".git").is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_PULL_TIMEOUT,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def read_installed_commit(uuid: str) -> str | None:
+    marker = EXT_INSTALL_DIR / uuid / INSTALLED_COMMIT_FILENAME
+    try:
+        return marker.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def write_installed_commit(uuid: str, commit: str | None) -> None:
+    """Registra qué commit del repo quedó instalado, para detectar cambios futuros aunque no se suba la versión."""
+    if not commit:
+        return
+    marker = EXT_INSTALL_DIR / uuid / INSTALLED_COMMIT_FILENAME
+    try:
+        marker.write_text(commit + "\n")
+    except OSError:
+        pass
 
 
 def discover_extensions() -> list[Extension]:
@@ -123,11 +169,13 @@ def discover_extensions() -> list[Extension]:
                 source_version=meta.get("version"),
                 install_script=install_script if install_script.exists() else None,
                 uninstall_script=uninstall_script if uninstall_script.exists() else None,
+                source_commit=read_repo_commit(repo),
             )
         )
 
     for ext in extensions:
         ext.installed_version = read_installed_version(ext.uuid)
+        ext.installed_commit = read_installed_commit(ext.uuid)
 
     extensions.sort(key=lambda e: e.name.casefold())
     return extensions
@@ -340,25 +388,30 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         def worker():
             for i, repo in enumerate(repos, start=1):
                 git_pull(repo)
-                GLib.idle_add(self._on_repo_pulled, repo, i, total)
+                commit = read_repo_commit(repo)
+                GLib.idle_add(self._on_repo_pulled, repo, commit, i, total)
             GLib.idle_add(self._on_pull_done)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_repo_pulled(self, repo: Path, done: int, total: int) -> bool:
+    def _on_repo_pulled(self, repo: Path, commit: str | None, done: int, total: int) -> bool:
         self.status_progress.set_fraction(done / total)
 
         meta_path = find_metadata(repo)
+        meta = None
         if meta_path is not None:
             try:
                 meta = json.loads(meta_path.read_text())
             except (json.JSONDecodeError, OSError):
                 meta = None
+
+        for ext in self.extensions:
+            if ext.repo_path != repo:
+                continue
+            ext.source_commit = commit
             if meta:
-                for ext in self.extensions:
-                    if ext.repo_path == repo:
-                        ext.source_version = meta.get("version", ext.source_version)
-                        self._refresh_row_suffix(ext)
+                ext.source_version = meta.get("version", ext.source_version)
+            self._refresh_row_suffix(ext)
         return False
 
     def _on_pull_done(self) -> bool:
@@ -451,7 +504,15 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
 
         if ext.is_installed:
             if ext.has_update:
-                status = Gtk.Label(label=f"v{ext.installed_version} → v{ext.source_version}")
+                if (
+                    isinstance(ext.source_version, int)
+                    and isinstance(ext.installed_version, int)
+                    and ext.source_version > ext.installed_version
+                ):
+                    label = f"v{ext.installed_version} → v{ext.source_version}"
+                else:
+                    label = f"v{ext.installed_version} (actualización disponible)"
+                status = Gtk.Label(label=label)
                 status.add_css_class("warning")
             else:
                 status = Gtk.Label(label=f"v{ext.installed_version}")
@@ -503,11 +564,18 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
     def _do_install(self, ext: Extension) -> None:
         if ext.install_script:
             action = "Actualizando" if ext.has_update else "Instalando"
-            dlg = RunDialog(f"{action} {ext.name}", ext.install_script, on_done=lambda ok: self.refresh(pull=False))
+
+            def on_done(ok: bool) -> None:
+                if ok:
+                    write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                self.refresh(pull=False)
+
+            dlg = RunDialog(f"{action} {ext.name}", ext.install_script, on_done=on_done)
             dlg.present(self)
         else:
             def worker():
                 generic_install(ext)
+                write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
                 GLib.idle_add(self._rebuild)
 
             threading.Thread(target=worker, daemon=True).start()
@@ -580,7 +648,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
                 script = ext.install_script if install else ext.uninstall_script
                 if script is not None:
                     try:
-                        subprocess.run(
+                        result = subprocess.run(
                             ["bash", str(script)],
                             cwd=str(script.parent),
                             stdin=subprocess.DEVNULL,
@@ -588,10 +656,14 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
                             timeout=SCRIPT_TIMEOUT,
                             check=False,
                         )
+                        if install and result.returncode == 0:
+                            write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
                     except (subprocess.TimeoutExpired, OSError):
                         pass
                 else:
                     (generic_install if install else generic_uninstall)(ext)
+                    if install:
+                        write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
             GLib.idle_add(self._finish_bulk, check)
 
         threading.Thread(target=worker, daemon=True).start()
