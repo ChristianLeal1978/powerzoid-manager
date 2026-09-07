@@ -341,6 +341,11 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Buscar actualizaciones")
         refresh_btn.connect("clicked", lambda *_: self.refresh(pull=True))
         header.pack_end(refresh_btn)
+        self.update_all_btn = Gtk.Button(label="Actualizar todas")
+        self.update_all_btn.add_css_class("suggested-action")
+        self.update_all_btn.connect("clicked", self._on_update_all_clicked)
+        self.update_all_btn.set_visible(False)
+        header.pack_end(self.update_all_btn)
         toolbar_view.add_top_bar(header)
 
         self.status_box = Gtk.Box(
@@ -452,12 +457,17 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
 
         installed = [e for e in self.extensions if e.is_installed]
         not_installed = [e for e in self.extensions if not e.is_installed]
+        outdated = [e for e in self.extensions if e.has_update]
 
         self.window_title.set_subtitle(
             f"{len(installed)} instalada(s) de {len(self.extensions)}"
             if installed
             else "Ninguna instalada — elige cuáles instalar"
         )
+
+        self.update_all_btn.set_label(f"Actualizar todas ({len(outdated)})")
+        self.update_all_btn.set_visible(bool(outdated))
+        self.update_all_btn.set_sensitive(True)
 
         group = Adw.PreferencesGroup(title="Extensiones PowerZoid")
         for ext in self.extensions:
@@ -619,7 +629,9 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             body=f"Se instalarán {len(pending)} extensiones: {names}.",
             ok_label="Instalar todas",
             destructive=False,
-            on_ok=lambda: self._run_bulk(pending, install=True, check=check),
+            on_ok=lambda: self._run_bulk(
+                pending, install=True, on_finish=lambda: self._reset_bulk_check(check), check=check
+            ),
             on_cancel=lambda: check.set_active(False),
         )
 
@@ -636,12 +648,32 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
             body=f"Se eliminarán {len(installed)} extensiones instaladas: {names}. Esta acción no se puede deshacer.",
             ok_label="Eliminar todas",
             destructive=True,
-            on_ok=lambda: self._run_bulk(installed, install=False, check=check),
+            on_ok=lambda: self._run_bulk(
+                installed, install=False, on_finish=lambda: self._reset_bulk_check(check), check=check
+            ),
             on_cancel=lambda: check.set_active(False),
         )
 
-    def _run_bulk(self, items: list[Extension], install: bool, check: Gtk.CheckButton) -> None:
-        check.set_sensitive(False)
+    def _reset_bulk_check(self, check: Gtk.CheckButton) -> None:
+        check.set_active(False)
+        check.set_sensitive(True)
+
+    def _on_update_all_clicked(self, *_args) -> None:
+        outdated = [e for e in self.extensions if e.has_update]
+        if not outdated:
+            return
+        names = ", ".join(e.name for e in outdated)
+        self._confirm(
+            heading="Actualizar todas",
+            body=f"Se actualizarán {len(outdated)} extensiones: {names}.",
+            ok_label="Actualizar todas",
+            destructive=False,
+            on_ok=lambda: self._run_bulk(outdated, install=True, on_finish=None, check=self.update_all_btn),
+        )
+
+    def _run_bulk(self, items: list[Extension], install: bool, on_finish, check: Gtk.Widget | None = None) -> None:
+        if check is not None:
+            check.set_sensitive(False)
 
         def worker():
             for ext in items:
@@ -664,13 +696,13 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
                     (generic_install if install else generic_uninstall)(ext)
                     if install:
                         write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
-            GLib.idle_add(self._finish_bulk, check)
+            GLib.idle_add(self._finish_bulk, on_finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_bulk(self, check: Gtk.CheckButton) -> bool:
-        check.set_active(False)
-        check.set_sensitive(True)
+    def _finish_bulk(self, on_finish) -> bool:
+        if on_finish:
+            on_finish()
         self._rebuild()
         return False
 
