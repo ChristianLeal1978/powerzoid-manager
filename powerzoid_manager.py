@@ -39,7 +39,6 @@ ICON_BY_UUID = {
     "powerzoid-memory@cleal.cl": "org.gnome.SystemMonitor-symbolic",
     "powerzoid-music@cleal.cl": "audio-headphones-symbolic",
     "powerzoid-screenshot@cleal.cl": "camera-photo-symbolic",
-    "powerzoid-sync@cleal.cl": "folder-remote-symbolic",
     "powerzoid-todo@cleal.cl": "task-due-symbolic",
     "powerzoid-workspaces@cleal.cl": "view-grid-symbolic",
     PURRR_UUID: "io.github.christianlealreyes.Purrr",
