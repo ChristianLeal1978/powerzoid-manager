@@ -23,6 +23,13 @@ GIT_PULL_TIMEOUT = 15
 SCRIPT_TIMEOUT = 300
 INSTALLED_COMMIT_FILENAME = ".powerzoid-installed-commit"
 
+# Purrr no es un PowerZoid (no es una extensión de GNOME Shell, sino una app GTK
+# aparte con su propio venv), pero se vigila en la misma lista para avisar de
+# actualizaciones pendientes.
+PURRR_REPO = REPOS_DIR / "purrr"
+PURRR_UUID = "purrr@cleal.cl"
+PURRR_STATE_DIR = Path.home() / ".local/share/purrr"
+
 DEFAULT_ICON = "application-x-addon-symbolic"
 ICON_BY_UUID = {
     "powerzoid-calendar@cleal.cl": "x-office-calendar-symbolic",
@@ -35,6 +42,7 @@ ICON_BY_UUID = {
     "powerzoid-sync@cleal.cl": "folder-remote-symbolic",
     "powerzoid-todo@cleal.cl": "task-due-symbolic",
     "powerzoid-workspaces@cleal.cl": "view-grid-symbolic",
+    PURRR_UUID: "io.github.christianlealreyes.Purrr",
 }
 
 
@@ -51,10 +59,11 @@ class Extension:
     source_commit: str | None = None
     installed_version: int | None = None
     installed_commit: str | None = None
+    always_installed: bool = False
 
     @property
     def is_installed(self) -> bool:
-        return self.installed_version is not None
+        return self.always_installed or self.installed_version is not None
 
     @property
     def has_update(self) -> bool:
@@ -114,20 +123,27 @@ def read_repo_commit(repo: Path) -> str | None:
     return result.stdout.strip() or None
 
 
-def read_installed_commit(uuid: str) -> str | None:
-    marker = EXT_INSTALL_DIR / uuid / INSTALLED_COMMIT_FILENAME
+def installed_commit_marker(uuid: str) -> Path:
+    """Purrr no vive en EXT_INSTALL_DIR (no es una extensión GNOME), así que guarda su
+    marcador en su propio directorio de datos."""
+    if uuid == PURRR_UUID:
+        return PURRR_STATE_DIR / INSTALLED_COMMIT_FILENAME
+    return EXT_INSTALL_DIR / uuid / INSTALLED_COMMIT_FILENAME
+
+
+def read_installed_commit(marker: Path) -> str | None:
     try:
         return marker.read_text().strip() or None
     except OSError:
         return None
 
 
-def write_installed_commit(uuid: str, commit: str | None) -> None:
+def write_installed_commit(marker: Path, commit: str | None) -> None:
     """Registra qué commit del repo quedó instalado, para detectar cambios futuros aunque no se suba la versión."""
     if not commit:
         return
-    marker = EXT_INSTALL_DIR / uuid / INSTALLED_COMMIT_FILENAME
     try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(commit + "\n")
     except OSError:
         pass
@@ -173,9 +189,34 @@ def discover_extensions() -> list[Extension]:
             )
         )
 
+    if (PURRR_REPO / ".git").is_dir():
+        extensions.append(
+            Extension(
+                repo_path=PURRR_REPO,
+                meta_path=PURRR_REPO / "pyproject.toml",
+                uuid=PURRR_UUID,
+                name="Purrr",
+                description=(
+                    "Reproductor de música GTK4/libadwaita (no es un PowerZoid, "
+                    "pero se vigila igual)"
+                ),
+                source_version=None,
+                install_script=None,
+                uninstall_script=None,
+                source_commit=read_repo_commit(PURRR_REPO),
+                always_installed=True,
+            )
+        )
+
     for ext in extensions:
         ext.installed_version = read_installed_version(ext.uuid)
-        ext.installed_commit = read_installed_commit(ext.uuid)
+        marker = installed_commit_marker(ext.uuid)
+        ext.installed_commit = read_installed_commit(marker)
+        if ext.uuid == PURRR_UUID and ext.installed_commit is None and ext.source_commit:
+            # Primera vez que se detecta Purrr: toma el commit actual como línea base
+            # en vez de mostrar una "actualización disponible" falsa de entrada.
+            write_installed_commit(marker, ext.source_commit)
+            ext.installed_commit = ext.source_commit
 
     extensions.sort(key=lambda e: e.name.casefold())
     return extensions
@@ -198,6 +239,19 @@ def git_pull(repo: Path) -> None:
 
 def generic_install(ext: Extension) -> None:
     """Instala copiando los archivos de la extensión, para repos sin install.sh."""
+    if ext.uuid == PURRR_UUID:
+        # Instalación editable: el `git pull` ya deja el código en vivo, solo falta
+        # sincronizar dependencias nuevas del pyproject.toml.
+        venv_pip = ext.repo_path / ".venv/bin/pip"
+        if venv_pip.exists():
+            subprocess.run(
+                [str(venv_pip), "install", "-e", ".", "--quiet"],
+                cwd=str(ext.repo_path),
+                capture_output=True,
+                timeout=SCRIPT_TIMEOUT,
+                check=False,
+            )
+        return
     source = ext.meta_path.parent
     target = EXT_INSTALL_DIR / ext.uuid
     # Algunos repos symlinkean su carpeta de extensión directamente dentro de
@@ -210,6 +264,9 @@ def generic_install(ext: Extension) -> None:
 
 def generic_uninstall(ext: Extension) -> None:
     """Desinstala genéricamente, para repos sin uninstall.sh."""
+    if ext.uuid == PURRR_UUID:
+        # Purrr es una app aparte, no una extensión: este manager no la desinstala.
+        return
     subprocess.run(["gnome-extensions", "disable", ext.uuid], capture_output=True, check=False)
     shutil.rmtree(EXT_INSTALL_DIR / ext.uuid, ignore_errors=True)
 
@@ -462,6 +519,9 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         installed = [e for e in self.extensions if e.is_installed]
         not_installed = [e for e in self.extensions if not e.is_installed]
         outdated = [e for e in self.extensions if e.has_update]
+        # Purrr no es una extensión GNOME: este manager la actualiza pero no la
+        # instala ni la elimina, así que queda fuera de esos flujos masivos.
+        removable_installed = [e for e in installed if e.uuid != PURRR_UUID]
 
         self.window_title.set_subtitle(
             f"{len(installed)} instalada(s) de {len(self.extensions)}"
@@ -488,9 +548,9 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         bulk_box.append(self.install_all_check)
 
         self.remove_all_check = Gtk.CheckButton(
-            label=f"Eliminar todas las instaladas ({len(installed)})"
+            label=f"Eliminar todas las instaladas ({len(removable_installed)})"
         )
-        self.remove_all_check.set_visible(bool(installed))
+        self.remove_all_check.set_visible(bool(removable_installed))
         self.remove_all_check.connect("toggled", self._on_remove_all)
         bulk_box.append(self.remove_all_check)
 
@@ -515,6 +575,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
 
     def _build_suffix(self, ext: Extension) -> Gtk.Box:
         suffix = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, valign=Gtk.Align.CENTER)
+        is_purrr = ext.uuid == PURRR_UUID
 
         if ext.is_installed:
             if ext.has_update:
@@ -524,16 +585,29 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
                     and ext.source_version > ext.installed_version
                 ):
                     label = f"v{ext.installed_version} → v{ext.source_version}"
+                elif is_purrr:
+                    label = "actualización disponible"
                 else:
                     label = f"v{ext.installed_version} (actualización disponible)"
                 status = Gtk.Label(label=label)
                 status.add_css_class("warning")
+            elif is_purrr:
+                status = Gtk.Label(label="al día")
+                status.add_css_class("dim-label")
             else:
                 status = Gtk.Label(label=f"v{ext.installed_version}")
                 status.add_css_class("dim-label")
             suffix.append(status)
 
-        if not ext.is_installed:
+        if is_purrr:
+            # No es una extensión GNOME: este manager solo la actualiza, no la
+            # instala ni la elimina.
+            if ext.has_update:
+                update_btn = Gtk.Button(label="Actualizar")
+                update_btn.add_css_class("suggested-action")
+                update_btn.connect("clicked", lambda *_, e=ext: self._do_install(e))
+                suffix.append(update_btn)
+        elif not ext.is_installed:
             install_btn = Gtk.Button(label="Instalar")
             install_btn.add_css_class("suggested-action")
             install_btn.connect("clicked", lambda *_, e=ext: self._do_install(e))
@@ -581,7 +655,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
 
             def on_done(ok: bool) -> None:
                 if ok:
-                    write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                    write_installed_commit(installed_commit_marker(ext.uuid), read_repo_commit(ext.repo_path))
                 self.refresh(pull=False)
 
             dlg = RunDialog(f"{action} {ext.name}", ext.install_script, on_done=on_done)
@@ -591,7 +665,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
                 error = None
                 try:
                     generic_install(ext)
-                    write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                    write_installed_commit(installed_commit_marker(ext.uuid), read_repo_commit(ext.repo_path))
                 except OSError as exc:
                     error = str(exc)
                 GLib.idle_add(self._on_generic_done, error)
@@ -660,7 +734,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
     def _on_remove_all(self, check: Gtk.CheckButton) -> None:
         if not check.get_active():
             return
-        installed = [e for e in self.extensions if e.is_installed]
+        installed = [e for e in self.extensions if e.is_installed and e.uuid != PURRR_UUID]
         if not installed:
             check.set_active(False)
             return
@@ -735,11 +809,11 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
                         except (subprocess.TimeoutExpired, OSError):
                             ok = False
                         if install and ok:
-                            write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                            write_installed_commit(installed_commit_marker(ext.uuid), read_repo_commit(ext.repo_path))
                     else:
                         (generic_install if install else generic_uninstall)(ext)
                         if install:
-                            write_installed_commit(ext.uuid, read_repo_commit(ext.repo_path))
+                            write_installed_commit(installed_commit_marker(ext.uuid), read_repo_commit(ext.repo_path))
                 except OSError:
                     # No dejamos que una extensión rota (p. ej. un symlink de desarrollo
                     # que rompe la copia) tumbe el hilo y deje sin procesar al resto.
@@ -755,7 +829,7 @@ class PowerzoidManagerWindow(Adw.ApplicationWindow):
         self.status_progress.set_fraction(done / total)
         self.status_label.set_label(f"{verb} {done}/{total}: {ext.name}")
         ext.installed_version = read_installed_version(ext.uuid)
-        ext.installed_commit = read_installed_commit(ext.uuid)
+        ext.installed_commit = read_installed_commit(installed_commit_marker(ext.uuid))
         self._refresh_row_suffix(ext)
         return False
 
